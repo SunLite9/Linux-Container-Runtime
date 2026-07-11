@@ -21,23 +21,45 @@ cmake ..
 make
 ```
 
-## Usage (Phase 1: namespace isolation)
+## Usage
+
+Run once, from the project root, to fetch the Alpine root filesystem:
 
 ```
-sudo ./build/container-runtime run /bin/sh
+./scripts/fetch-rootfs.sh
 ```
 
-This drops you into a shell that is isolated from the host via four
-namespaces. Default command is `/bin/sh` if none is given:
-`sudo ./build/container-runtime run` also works.
+Then:
+
+```
+sudo ./build/container-runtime run [--cpu-limit N] [--memory-limit MB] [command] [args...]
+```
+
+- `--cpu-limit N` — fraction of one CPU core, e.g. `0.5` (default `0.5`).
+- `--memory-limit MB` — memory cap in megabytes (default `100`).
+- `command` — defaults to `/bin/sh` if omitted.
+
+Must be run from the project root, so the hardcoded `rootfs/alpine` path
+resolves correctly (Task 6 replaces this with a registry-pulled image path).
+
+Examples:
+
+```
+sudo ./build/container-runtime run
+sudo ./build/container-runtime run --cpu-limit 0.2 --memory-limit 50 /bin/sh
+```
+
+This drops you into a shell that is isolated via four namespaces, pivoted
+into its own Alpine root filesystem, and capped by cgroup v2 CPU/memory
+limits.
 
 ## Project layout
 
 ```
 src/main.cpp        entrypoint, CLI parsing
-src/namespaces/      namespace isolation (this phase)
-src/cgroups/         resource limits (later phase)
-src/fs/              pivot_root / OverlayFS (later phase)
+src/namespaces/      namespace isolation (Phase 1)
+src/cgroups/         cgroup v2 CPU/memory limits (Phase 3)
+src/fs/              pivot_root (Phase 2) / OverlayFS (later phase)
 src/network/         veth + bridge + NAT (later phase)
 src/registry/        Docker Hub registry client (later phase)
 include/             shared headers (later phases)
@@ -213,3 +235,113 @@ PRETTY_NAME="Ubuntu 26.04 LTS"
 - The host's own `/`, `/etc/os-release`, and process list are completely
   unaffected — the `MS_REC | MS_PRIVATE` remount and the `pivot_root` are
   fully contained within the container's own mount and PID namespaces.
+
+## Phase 3: cgroups v2 resource limits
+
+### Design
+
+`cr::cgroups::CGroup` (`src/cgroups/cgroups.cpp`/`.hpp`) owns one cgroup
+v2 group per container, at `/sys/fs/cgroup/container-runtime/<pid>`
+(`<pid>` — the container's PID as seen in the host/parent's PID namespace,
+since cgroup membership is written from the writer's own namespace view —
+doubles as a unique, self-cleaning container ID).
+
+On this host, `cpu` and `memory` were already enabled in the root cgroup's
+`cgroup.subtree_control` (visible via `cat /sys/fs/cgroup/cgroup.subtree_control`
+→ `cpu memory pids`), so `container-runtime/` inherits them automatically.
+The constructor still has to enable them in `container-runtime/`'s *own*
+`subtree_control` so each per-container child directory underneath it can
+use them — a cgroup only gets access to a controller if its parent
+explicitly delegates it, all the way up the tree.
+
+Construction, in order:
+
+1. `mkdir -p /sys/fs/cgroup/container-runtime` (idempotent).
+2. Write `+cpu +memory` to its `cgroup.subtree_control` (also idempotent —
+   re-enabling an already-enabled controller is a no-op to the kernel).
+3. `mkdir /sys/fs/cgroup/container-runtime/<pid>` for this container.
+4. Write `cpu.max` as `"<quota_us> <period_us>"` — e.g. `--cpu-limit 0.5`
+   with the standard 100ms period becomes `"50000 100000"`: 50ms of CPU
+   time allowed per 100ms period, i.e. half a core.
+5. Write `memory.max` as a raw byte count — `--memory-limit 100` becomes
+   `104857600`.
+
+`addProcess(pid)` writes the container's PID to `cgroup.procs`, called
+from `Container::run()` right after `clone()` returns (before `waitpid`),
+applying both limits to the container process (and anything it forks)
+from the start.
+
+**RAII cleanup:** `~CGroup()` calls `rmdir()` on the container's cgroup
+directory. This is only called after `Container::run()`'s `waitpid()`
+returns — cgroup v2 requires a group to be empty of member processes
+before it can be removed, and by the time the C++ destructor runs, the
+container's process has already exited and been reaped, so the directory
+is guaranteed empty. One real limitation, observed while testing: this
+only works if the *container-runtime process itself* exits through normal
+control flow. If something sends `SIGKILL` directly to `container-runtime`
+(not to the containerized process), no C++ destructor runs at all — a
+stray cgroup directory can be left behind, requiring manual `rmdir`. This
+is an inherent limit of process-lifetime-scoped RAII, not something
+specific to this implementation: a killed process cannot run any of its
+own cleanup code, C++ or otherwise. Real container runtimes handle this
+with a separate reconciliation/garbage-collection pass; out of scope here.
+
+### CLI
+
+`--cpu-limit N` (fraction of a core, default `0.5`) and `--memory-limit MB`
+(default `100`) are parsed in `main.cpp` with simple hand-rolled argument
+parsing — no dependency was worth adding for two optional flags.
+
+### Verification — memory limit
+
+Compiled a small static memory-hog (`memhog.c`, not checked into this
+repo — a throwaway test tool) that `malloc`s and `memset`s 10 MB chunks in
+a loop, dropped it into `rootfs/alpine/usr/local/bin/memhog`, and ran it
+capped at 50 MB:
+
+```
+$ sudo ./build/container-runtime run --cpu-limit 0.5 --memory-limit 50 /usr/local/bin/memhog
+Allocated 10 MB
+Allocated 20 MB
+Allocated 30 MB
+Allocated 40 MB
+Allocated 50 MB
+```
+
+(Output stops abruptly at 50 MB — no "malloc failed" message, because the
+process was killed outright, not returned a failing `malloc`.) Host kernel
+log (`dmesg`) at the same moment:
+
+```
+memhog invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0
+...
+oom_kill_process.cold+0x8/0xb5
+out_of_memory+0xff/0x2b0
+mem_cgroup_out_of_memory+0xc8/0xe0
+try_charge_memcg+0x3c3/0x620
+...
+oom-kill:constraint=CONSTRAINT_MEMCG,...,oom_memcg=/container-runtime/21612,task_memcg=/container-runtime/21612,task=memhog,pid=21612,uid=0
+Memory cgroup out of memory: Killed process 21612 (memhog) total-vm:62472kB, anon-rss:53480kB, file-rss:672kB, shmem-rss:0kB, UID:0 pgtables:148kB oom_score_adj:0
+```
+
+`constraint=CONSTRAINT_MEMCG` and `oom_memcg=/container-runtime/21612`
+confirm this was the container's own cgroup memory limit killing it — not
+a host-wide OOM condition. The host (`uptime` immediately after: `load
+average: 0.03, 0.01, 0.00`) never noticed.
+
+### Verification — CPU limit
+
+Ran a CPU-bound busy loop (`i=0; while true; do i=$((i+1)); done`) capped
+at `--cpu-limit 0.2` (20% of one core), and sampled the cgroup's own
+`cpu.stat` `usage_usec` counter before and after a 5-second window on the
+host, rather than trusting `top`'s instantaneous sampling:
+
+```
+usage_usec delta: 1000143   (over 5.013890114 s wall-clock)
+1000143 µs / 1,000,000 = 1.000143 s of CPU time consumed
+1.000143 / 5.013890114 = 0.1995  →  19.95% actual CPU usage
+```
+
+19.95% actual usage against a 20% configured cap — the limit holds to
+within measurement noise. For comparison, the same loop with no cgroup at
+all pins a full core (100%) on this single-vCPU `t3.micro`.

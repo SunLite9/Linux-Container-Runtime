@@ -19,8 +19,12 @@ namespace {
 constexpr size_t kStackSize = 1024 * 1024; // 1 MB
 } // namespace
 
-Container::Container(std::string rootfsPath, std::string command, std::vector<std::string> args)
-    : rootfsPath_(std::move(rootfsPath)), command_(std::move(command)), args_(std::move(args)) {}
+Container::Container(std::string rootfsPath, std::string command, std::vector<std::string> args,
+                      cgroups::Limits limits)
+    : rootfsPath_(std::move(rootfsPath)),
+      command_(std::move(command)),
+      args_(std::move(args)),
+      limits_(limits) {}
 
 Container::~Container() {
     if (childPid_ > 0) {
@@ -82,9 +86,24 @@ void Container::run() {
         std::exit(1);
     }
 
-    int status = 0;
-    waitpid(childPid_, &status, 0);
-    childPid_ = -1; // already reaped, nothing left for the destructor to do
+    // childPid_ here is the PID as seen from this (parent/host) PID
+    // namespace, which is what cgroup.procs expects — cgroup membership
+    // is written from the writer's own namespace view, not the child's.
+    try {
+        cgroups::CGroup group(std::to_string(childPid_), limits_);
+        group.addProcess(childPid_);
+
+        int status = 0;
+        waitpid(childPid_, &status, 0);
+        childPid_ = -1; // already reaped, nothing left for the destructor to do
+        // group's destructor removes the cgroup directory here, now that
+        // the container process (its only member) has exited.
+    } catch (const std::exception& e) {
+        fprintf(stderr, "cgroup setup failed: %s\n", e.what());
+        waitpid(childPid_, nullptr, 0);
+        childPid_ = -1;
+    }
+
     munmap(stack, kStackSize);
 }
 

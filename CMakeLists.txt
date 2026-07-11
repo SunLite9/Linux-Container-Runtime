@@ -8,6 +8,7 @@ add_executable(container-runtime
     src/main.cpp
     src/namespaces/container.cpp
     src/fs/rootfs.cpp
+    src/cgroups/cgroups.cpp
 )
 
 target_include_directories(container-runtime PRIVATE include src)

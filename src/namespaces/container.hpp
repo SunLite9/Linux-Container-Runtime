@@ -4,6 +4,8 @@
 #include <vector>
 #include <sys/types.h>
 
+#include "../cgroups/cgroups.hpp"
+
 namespace cr {
 
 // Runs a command inside new PID, UTS, IPC, and mount namespaces.
@@ -17,7 +19,8 @@ namespace cr {
 // cleanup calls scattered through main().
 class Container {
 public:
-    Container(std::string rootfsPath, std::string command, std::vector<std::string> args);
+    Container(std::string rootfsPath, std::string command, std::vector<std::string> args,
+              cgroups::Limits limits = {});
     ~Container();
 
     Container(const Container&) = delete;
@@ -34,6 +37,7 @@ private:
     std::string rootfsPath_;
     std::string command_;
     std::vector<std::string> args_;
+    cgroups::Limits limits_;
     pid_t childPid_ = -1;
 };
 
