@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(container-runtime
     src/main.cpp
     src/namespaces/container.cpp
+    src/fs/rootfs.cpp
 )
 
 target_include_directories(container-runtime PRIVATE include src)

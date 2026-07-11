@@ -1,4 +1,5 @@
 #include "container.hpp"
+#include "../fs/rootfs.hpp"
 
 #include <sched.h>
 #include <sys/mman.h>
@@ -8,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 
 namespace cr {
 
@@ -17,8 +19,8 @@ namespace {
 constexpr size_t kStackSize = 1024 * 1024; // 1 MB
 } // namespace
 
-Container::Container(std::string command, std::vector<std::string> args)
-    : command_(std::move(command)), args_(std::move(args)) {}
+Container::Container(std::string rootfsPath, std::string command, std::vector<std::string> args)
+    : rootfsPath_(std::move(rootfsPath)), command_(std::move(command)), args_(std::move(args)) {}
 
 Container::~Container() {
     if (childPid_ > 0) {
@@ -36,6 +38,13 @@ int Container::childMain() {
     // Proves UTS namespace isolation: this hostname is not visible on the host.
     if (sethostname("container", 9) != 0) {
         perror("sethostname");
+        return 1;
+    }
+
+    try {
+        fs::PivotRoot pivot(rootfsPath_);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "pivot_root into %s failed: %s\n", rootfsPath_.c_str(), e.what());
         return 1;
     }
 

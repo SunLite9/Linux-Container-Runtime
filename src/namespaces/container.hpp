@@ -17,20 +17,21 @@ namespace cr {
 // cleanup calls scattered through main().
 class Container {
 public:
-    Container(std::string command, std::vector<std::string> args);
+    Container(std::string rootfsPath, std::string command, std::vector<std::string> args);
     ~Container();
 
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
 
-    // Clones the isolated child, execs the command inside it, and blocks
-    // until it exits.
+    // Clones the isolated child, pivots it into rootfsPath, execs the
+    // command inside it, and blocks until it exits.
     void run();
 
 private:
     static int childEntry(void* arg);
     int childMain();
 
+    std::string rootfsPath_;
     std::string command_;
     std::vector<std::string> args_;
     pid_t childPid_ = -1;
