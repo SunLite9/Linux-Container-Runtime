@@ -1,0 +1,6 @@
+build/
+*.o
+*.tar
+*.tar.gz
+rootfs/
+*.img

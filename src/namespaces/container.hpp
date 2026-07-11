@@ -1,0 +1,39 @@
+#pragma once
+
+#include <string>
+#include <vector>
+#include <sys/types.h>
+
+namespace cr {
+
+// Runs a command inside new PID, UTS, IPC, and mount namespaces.
+//
+// RAII note: the clone()'d child is synchronously waited on inside run(),
+// so there is no long-lived kernel resource for the destructor to release
+// yet. The destructor still reaps the child if run() was never called to
+// completion (e.g. an exception unwinds through here), which is the pattern
+// later phases (cgroups, overlay mounts, network namespaces) build on: each
+// resource-owning class cleans itself up on destruction, not via manual
+// cleanup calls scattered through main().
+class Container {
+public:
+    Container(std::string command, std::vector<std::string> args);
+    ~Container();
+
+    Container(const Container&) = delete;
+    Container& operator=(const Container&) = delete;
+
+    // Clones the isolated child, execs the command inside it, and blocks
+    // until it exits.
+    void run();
+
+private:
+    static int childEntry(void* arg);
+    int childMain();
+
+    std::string command_;
+    std::vector<std::string> args_;
+    pid_t childPid_ = -1;
+};
+
+} // namespace cr
