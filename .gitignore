@@ -3,4 +3,5 @@ build/
 *.tar
 *.tar.gz
 rootfs/
+overlay-data/
 *.img

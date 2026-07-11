@@ -1,4 +1,5 @@
 #include "container.hpp"
+#include "../fs/overlay.hpp"
 #include "../fs/rootfs.hpp"
 
 #include <sched.h>
@@ -46,9 +47,9 @@ int Container::childMain() {
     }
 
     try {
-        fs::PivotRoot pivot(rootfsPath_);
+        fs::PivotRoot pivot(pivotTarget_);
     } catch (const std::exception& e) {
-        fprintf(stderr, "pivot_root into %s failed: %s\n", rootfsPath_.c_str(), e.what());
+        fprintf(stderr, "pivot_root into %s failed: %s\n", pivotTarget_.c_str(), e.what());
         return 1;
     }
 
@@ -66,6 +67,14 @@ int Container::childMain() {
 }
 
 void Container::run() {
+    // Own PID (this runtime process's, not the container's — that's not
+    // known until after clone()) uniquely identifies this container
+    // instance, so the overlay's upper/work/merged directories don't
+    // collide with a concurrently-running container using the same lower
+    // layer.
+    fs::Overlay overlay({rootfsPath_}, std::to_string(getpid()));
+    pivotTarget_ = overlay.mergedPath();
+
     void* stack = mmap(nullptr, kStackSize, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
     if (stack == MAP_FAILED) {
@@ -77,7 +86,9 @@ void Container::run() {
     // clone() over fork()+unshare(): a single syscall creates the child
     // already inside the new namespaces, so there's no window where the
     // child briefly shares PID/UTS/IPC/mount state with the parent before
-    // unshare() takes effect.
+    // unshare() takes effect. The overlay mounted above is already part
+    // of this process's mount table, so CLONE_NEWNS's snapshot carries it
+    // into the child automatically.
     const int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNS | SIGCHLD;
     childPid_ = clone(&Container::childEntry, stackTop, flags, this);
     if (childPid_ == -1) {

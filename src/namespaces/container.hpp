@@ -26,8 +26,9 @@ public:
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
 
-    // Clones the isolated child, pivots it into rootfsPath, execs the
-    // command inside it, and blocks until it exits.
+    // Mounts an overlay over rootfsPath, clones the isolated child, pivots
+    // it into the merged overlay directory, execs the command inside it,
+    // and blocks until it exits.
     void run();
 
 private:
@@ -39,6 +40,9 @@ private:
     std::vector<std::string> args_;
     cgroups::Limits limits_;
     pid_t childPid_ = -1;
+    // Set by run() before clone(), to the overlay's merged directory;
+    // childMain() pivot_roots into this rather than rootfsPath_ directly.
+    std::string pivotTarget_;
 };
 
 } // namespace cr

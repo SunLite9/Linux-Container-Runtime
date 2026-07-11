@@ -345,3 +345,106 @@ usage_usec delta: 1000143   (over 5.013890114 s wall-clock)
 19.95% actual usage against a 20% configured cap — the limit holds to
 within measurement noise. For comparison, the same loop with no cgroup at
 all pins a full core (100%) on this single-vCPU `t3.micro`.
+
+## Phase 4: OverlayFS layered filesystem
+
+### Design
+
+`cr::fs::Overlay` (`src/fs/overlay.cpp`/`.hpp`) mounts a container's root as
+an OverlayFS combining:
+
+- **`lowerdir`** — one or more read-only image layers (currently just
+  `rootfs/alpine`; Task 6's registry puller will make this a real list of
+  layers pulled from a registry).
+- **`upperdir`** — a fresh, container-specific writable layer.
+- **`workdir`** — OverlayFS's required scratch directory for internal
+  bookkeeping (atomic rename operations, etc.) — never touched directly,
+  but mandatory.
+- **`merged`** (the mount target) — the single directory tree a process
+  actually sees, combining all of the above.
+
+All four live under `overlay-data/<containerId>/`, where `containerId` is
+this **runtime process's own PID** (`getpid()`), not the container's PID —
+the overlay has to be mounted *before* `clone()` (see below), so the
+container's own PID doesn't exist yet at that point. This is a different
+ID scheme than `cgroups::CGroup` uses (that one waits until after `clone()`
+and uses the container's own PID) — both are simply the most convenient
+unique value available at the point each subsystem needs one.
+
+**Why mount before `clone()`, in the parent:** `clone(CLONE_NEWNS, ...)`
+gives the child a *copy* of the current mount table at the instant of the
+call — not a live view of the parent's future mounts. So `Container::run()`
+constructs `Overlay` (which mounts it) before calling `clone()`; the child
+then inherits the already-mounted merged directory for free, no extra
+plumbing required to get it into the container's own mount namespace. The
+existing `PivotRoot` (Phase 2) is otherwise unchanged — it just now
+receives the overlay's `mergedPath()` instead of the flat `rootfs/alpine`
+directory as its target, and mounting via `mount("overlay", merged, ...)`
+already makes `merged` a proper mount point, which is exactly what
+`pivot_root()` requires.
+
+**RAII cleanup:** `~Overlay()` unmounts `merged` (`umount2(..., MNT_DETACH)`)
+and removes `upper`, `work`, `merged`, and their now-empty parent directory
+— all on the *host* mount namespace/filesystem, in the parent process,
+after `waitpid()` returns in `Container::run()`. Lower layers are never
+touched by this destructor; that's what makes layer sharing free. (Hit the
+same class of bug as Phase 3's cgroup cleanup while testing this: an
+early version of `~Overlay()` removed `upper`/`work`/`merged` but forgot
+their shared parent directory, leaving an empty `overlay-data/<id>/`
+behind — fixed by explicitly removing `containerDir_` too.)
+
+### Verification
+
+**Isolation + concurrent execution** — ran two containers simultaneously
+(container A sleeps 6s and writes `/root/from_a.txt`; container B starts
+1s later, writes `/root/from_b.txt`, then lists `/root` from inside
+itself):
+
+```
+--- overlay-data while both running ---
+$ ls overlay-data/
+23631
+23638
+$ ls overlay-data/23631/merged/root/
+from_a.txt
+$ ls overlay-data/23638/merged/root/
+from_b.txt
+
+--- container B's own `ls /root`, run from inside container B ---
+from_b.txt
+```
+
+Container B's own view of `/root` shows only `from_b.txt` — `from_a.txt`,
+written concurrently by container A into A's own upper layer, never
+appears. Each container's writes are fully contained in its own
+`overlay-data/<pid>/upper/`.
+
+**Cleanup:**
+
+```
+--- overlay-data after both containers exit ---
+$ ls overlay-data/
+(empty)
+```
+
+Both containers' `upper`/`work`/`merged` directories (and their parent
+dirs) were fully removed once each process exited — no manual cleanup
+needed.
+
+**No lower-layer duplication:**
+
+```
+$ du -sh rootfs/alpine        # before running any containers
+9.5M    rootfs/alpine
+
+$ du -sh rootfs/alpine        # after both containers ran and exited
+9.5M    rootfs/alpine
+```
+
+Identical disk usage before and after two containers used `rootfs/alpine`
+as their shared lower layer — OverlayFS references the existing lower
+directory tree directly via the mount, rather than copying it per
+container. This is the actual mechanism (not just a claim) behind Docker's
+"shared base layers" storage efficiency: N containers built on the same
+base image cost roughly the size of N small upper layers, not N times the
+base image size.

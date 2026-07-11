@@ -8,6 +8,7 @@ add_executable(container-runtime
     src/main.cpp
     src/namespaces/container.cpp
     src/fs/rootfs.cpp
+    src/fs/overlay.cpp
     src/cgroups/cgroups.cpp
 )
 
