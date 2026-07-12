@@ -7,6 +7,10 @@ libraries. `sudo ./build/container-runtime run alpine:latest /bin/sh`
 pulls the real `alpine` image from Docker Hub and drops you into an
 isolated, resource-capped, networked shell running it.
 
+See [DESIGN.md](DESIGN.md) for the reasoning behind how this is built:
+alternatives considered and rejected, constraints that shaped the
+outcome, and what actually broke during construction.
+
 ## Architecture
 
 ```
@@ -27,7 +31,7 @@ container-runtime run <image> <command>
  [4] pivot_root into the merged overlay filesystem  (src/fs/rootfs.cpp)
         │
         ▼
- [5] Write cgroup v2 limits (cpu.max, memory.max)   (src/cgroups/)
+ [5] Write cgroup v2 limits (cpu.max, memory.max, pids.max) (src/cgroups/)
         │
         ▼
  [6] Create veth pair, attach to host bridge, configure NAT (src/network/)
@@ -60,11 +64,12 @@ make
 ## Usage
 
 ```
-sudo ./build/container-runtime run [--cpu-limit N] [--memory-limit MB] <image> [command] [args...]
+sudo ./build/container-runtime run [--cpu-limit N] [--memory-limit MB] [--pids-limit N] <image> [command] [args...]
 ```
 
 - `--cpu-limit N` — fraction of one CPU core, e.g. `0.5` (default `0.5`).
 - `--memory-limit MB` — memory cap in megabytes (default `100`).
+- `--pids-limit N` — max processes/threads in the container (default `128`).
 - `<image>` — a Docker Hub image reference, e.g. `alpine:latest`,
   `python:3.11-slim`. Pulled and cached under `image-cache/` on first use;
   later runs of the same image reuse the cache.
@@ -379,6 +384,33 @@ usage_usec delta: 1000143   (over 5.013890114 s wall-clock)
 within measurement noise. For comparison, the same loop with no cgroup at
 all pins a full core (100%) on this single-vCPU `t3.micro`.
 
+### Verification — pids limit (fork bomb)
+
+`pids.max` caps the number of processes/threads a container's cgroup can
+contain (`--pids-limit`, default 128). Ran an actual fork bomb
+(`bomb() { bomb & bomb & }; bomb`) capped at `--pids-limit 20`:
+
+```
+$ echo "timeout 5 sh -c 'bomb() { bomb & bomb & }; bomb'" \
+    | sudo ./build/container-runtime run --pids-limit 20 alpine:latest /bin/sh
+sh: can't fork: Resource temporarily unavailable
+sh: can't fork: Resource temporarily unavailable
+sh: can't fork: Resource temporarily unavailable
+sh: can't fork: Resource temporarily unavailable
+sh: can't fork: Resource temporarily unavailable
+
+$ uptime   # immediately after
+load average: 0.00, 0.00, 0.00
+```
+
+The kernel refuses new forks (`EAGAIN`) once the cgroup's 20-process cap
+is hit, `ash` doesn't retry, so the whole attempt completes in well under
+a second, and the host's load average stays at `0.00` throughout. This
+also surfaced a real gap: image layers ship with no device nodes, so
+`/dev/null` didn't exist and silently broke `ash`'s job-control
+backgrounding on the first attempt — fixed by bind-mounting the host's
+`/dev` during `pivot_root` (see `src/fs/rootfs.cpp`).
+
 ## OverlayFS layered filesystem
 
 ### Design
@@ -540,6 +572,15 @@ namespace itself is torn down once its last process exits. The shared
 `cr0` bridge is deliberately *not* torn down per-container — it's host
 infrastructure meant to persist across container runs, closer to how
 Docker's `docker0` bridge behaves.
+
+**Concurrency bug found and fixed:** `ensureBridge()`'s "check if `cr0`
+exists, create it if not" is a check-then-act race — two containers
+starting at the same instant could both see the bridge missing and both
+try to create it, and the loser would fail. Fixed with a `flock()`-based
+lock (`/run/container-runtime-bridge.lock`) around the whole
+check-then-create sequence. Verified by launching two containers with
+zero delay against a freshly-deleted bridge: both succeeded, and the
+bridge was created exactly once.
 
 ### Verification — outbound internet access
 
@@ -728,10 +769,47 @@ Python image, e.g. on `.../root` and `.../var/cache/apt/archives/partial`
 preserved the original restrictive permissions, like `/root` at mode
 `0700`, from the real image layers.)
 
+## Testing
+
+`scripts/test-harness.sh` builds on the manual verification above with a
+repeatable script: image compatibility across 4 images, cold-pull vs.
+cached-pull latency, p50/p95 startup time over repeated runs, and a leak
+check (cgroups, veth interfaces, overlay mounts/directories) after
+everything finishes. Run it with sudo from the project root after
+building. Actual output from a run against this host:
+
+```
+=== image compatibility ===
+alpine:latest: 0.79s          python:3.11-slim: 0.74s
+busybox:latest: 0.73s         debian:bookworm-slim: 0.77s
+
+=== cold vs. cached pull latency (alpine:latest) ===
+cold pull: 1.06s      cached: 0.71s
+
+=== repeated-run stats (alpine:latest, cached, x20) ===
+p50=0.736s  p95=0.920s  min=0.713s  max=0.920s
+
+=== leak check after all runs ===
+clean: no leaked mounts, cgroups, veth interfaces, or overlay dirs
+
+=== summary ===
+pass=26 fail=0 total=26  pass_rate=100.0%
+```
+
 ## Known limitations vs. real Docker
 
 Documented honestly, not glossed over:
 
+- **The security boundary is real but partial.** Namespaces + `pivot_root`
+  give filesystem/PID/hostname/IPC/network isolation, but the container
+  process runs as actual root with the full set of Linux capabilities —
+  there is no `CLONE_NEWUSER` (user namespace) UID remapping, no
+  capability dropping before `exec`, and no seccomp filter. A process
+  that finds a way to reach a host resource (e.g. via the bind-mounted
+  `/dev`, or a `mount()` syscall) is not stopped by anything this project
+  builds. See `DESIGN.md` for what full remediation would require.
+- **`/dev` is bind-mounted from the host**, not a private, minimal device
+  set — the container sees the same device nodes the host does.
 - **No image config parsing** — no default `CMD`/`ENTRYPOINT`/`ENV`;
   every `run` requires an explicit command.
 - **No digest/signature verification** of pulled layers — a real registry
@@ -753,6 +831,10 @@ Documented honestly, not glossed over:
   tracking multiple running containers across invocations.
 - **Networking uses shelled-out `ip`/`iptables`/`nsenter`**, not raw
   rtnetlink — chosen deliberately for readability in a portfolio project.
+- **No CI** — `scripts/test-harness.sh` is a local script, not automated
+  on every push. GitHub-hosted Actions runners restrict the privileged
+  operations (cgroup v2 delegation, `unshare`, `pivot_root`) this project
+  needs; real CI would need a self-hosted runner with genuine root access.
 
 ## What's proven
 
