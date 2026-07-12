@@ -6,3 +6,5 @@ rootfs/
 overlay-data/
 image-cache/
 *.img
+*.pem
+SKILL.md
