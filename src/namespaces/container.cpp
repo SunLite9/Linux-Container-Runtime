@@ -2,6 +2,7 @@
 #include "../fs/overlay.hpp"
 #include "../fs/rootfs.hpp"
 #include "../network/network.hpp"
+#include "../registry/registry.hpp"
 
 #include <sched.h>
 #include <sys/mman.h>
@@ -21,9 +22,9 @@ namespace {
 constexpr size_t kStackSize = 1024 * 1024; // 1 MB
 } // namespace
 
-Container::Container(std::string rootfsPath, std::string command, std::vector<std::string> args,
+Container::Container(std::string imageRef, std::string command, std::vector<std::string> args,
                       cgroups::Limits limits)
-    : rootfsPath_(std::move(rootfsPath)),
+    : imageRef_(std::move(imageRef)),
       command_(std::move(command)),
       args_(std::move(args)),
       limits_(limits) {}
@@ -78,12 +79,17 @@ int Container::childMain() {
 }
 
 void Container::run() {
+    // Pulls from the local cache if already present, or Docker Hub if
+    // not — see src/registry/. Layers come back ordered topmost-first,
+    // ready to hand straight to Overlay as lowerdir entries.
+    const registry::PulledImage image = registry::pull(imageRef_, "image-cache");
+
     // Own PID (this runtime process's, not the container's — that's not
     // known until after clone()) uniquely identifies this container
     // instance, so the overlay's upper/work/merged directories don't
     // collide with a concurrently-running container using the same lower
-    // layer.
-    fs::Overlay overlay({rootfsPath_}, std::to_string(getpid()));
+    // layer(s).
+    fs::Overlay overlay(image.layerDirs, std::to_string(getpid()));
     pivotTarget_ = overlay.mergedPath();
 
     if (pipe(readyPipe_) != 0) {

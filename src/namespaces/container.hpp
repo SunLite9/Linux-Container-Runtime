@@ -19,23 +19,24 @@ namespace cr {
 // cleanup calls scattered through main().
 class Container {
 public:
-    Container(std::string rootfsPath, std::string command, std::vector<std::string> args,
+    Container(std::string imageRef, std::string command, std::vector<std::string> args,
               cgroups::Limits limits = {});
     ~Container();
 
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
 
-    // Mounts an overlay over rootfsPath, clones the isolated child, pivots
-    // it into the merged overlay directory, execs the command inside it,
-    // and blocks until it exits.
+    // Pulls imageRef (from the registry cache, or Docker Hub if not
+    // cached), mounts an overlay over its layers, clones the isolated
+    // child, pivots it into the merged overlay directory, execs the
+    // command inside it, and blocks until it exits.
     void run();
 
 private:
     static int childEntry(void* arg);
     int childMain();
 
-    std::string rootfsPath_;
+    std::string imageRef_;
     std::string command_;
     std::vector<std::string> args_;
     cgroups::Limits limits_;

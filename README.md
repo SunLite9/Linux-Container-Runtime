@@ -1,57 +1,88 @@
 # container-runtime
 
 A minimal Docker-like container runtime built directly on raw Linux kernel
-primitives (namespaces, cgroups v2, OverlayFS, veth networking) in C++20 —
-no container framework libraries. Built in phases; this README grows with
-each phase.
+primitives — namespaces, cgroups v2, OverlayFS, veth networking, and a
+real Docker Hub registry client — in C++20, with no container framework
+libraries. `sudo ./build/container-runtime run alpine:latest /bin/sh`
+pulls the real `alpine` image from Docker Hub and drops you into an
+isolated, resource-capped, networked shell running it.
+
+## Architecture
+
+```
+container-runtime run <image> <command>
+        │
+        ▼
+ [1] Pull <image> from Docker Hub (registry v2 API) → layer tarballs,
+     cached locally                              (src/registry/)
+        │
+        ▼
+ [2] Extract layers, mount via OverlayFS (lower=image layers, upper=
+     writable)                                    (src/fs/overlay.cpp)
+        │
+        ▼
+ [3] clone() new PID, UTS, IPC, mount, network namespaces (src/namespaces/)
+        │
+        ▼
+ [4] pivot_root into the merged overlay filesystem  (src/fs/rootfs.cpp)
+        │
+        ▼
+ [5] Write cgroup v2 limits (cpu.max, memory.max)   (src/cgroups/)
+        │
+        ▼
+ [6] Create veth pair, attach to host bridge, configure NAT (src/network/)
+        │
+        ▼
+ [7] exec the container's command — isolated, resource-capped, networked
+```
+
+Steps 1-2 and 5-6 happen in the parent process, before/around a `clone()`
+call; a small pipe-based readiness barrier (see Phase 5) ensures the
+child never execs the container's command until all of that is finished.
 
 ## Requirements
 
 - A real Linux host (not macOS/WSL) — this project calls Linux-specific
   syscalls (`clone`, `unshare`, `mount`, `pivot_root`) directly.
-- root/sudo — namespace, mount, and (in later phases) cgroup syscalls
-  require elevated privileges.
-- A C++20 compiler (g++ or clang++) and CMake.
+- root/sudo — namespace, mount, cgroup, and network setup all require
+  elevated privileges.
+- A C++20 compiler (g++ or clang++), CMake, and `libcurl4-openssl-dev`.
+- Outbound internet access on the host, to pull images from Docker Hub.
 
 ## Building
 
 ```
 mkdir build && cd build
-cmake ..
+cmake ..    # fetches nlohmann/json via CMake FetchContent on first run
 make
 ```
 
 ## Usage
 
-Run once, from the project root, to fetch the Alpine root filesystem:
-
 ```
-./scripts/fetch-rootfs.sh
-```
-
-Then:
-
-```
-sudo ./build/container-runtime run [--cpu-limit N] [--memory-limit MB] [command] [args...]
+sudo ./build/container-runtime run [--cpu-limit N] [--memory-limit MB] <image> [command] [args...]
 ```
 
 - `--cpu-limit N` — fraction of one CPU core, e.g. `0.5` (default `0.5`).
 - `--memory-limit MB` — memory cap in megabytes (default `100`).
+- `<image>` — a Docker Hub image reference, e.g. `alpine:latest`,
+  `python:3.11-slim`. Pulled and cached under `image-cache/` on first use;
+  later runs of the same image reuse the cache.
 - `command` — defaults to `/bin/sh` if omitted.
-
-Must be run from the project root, so the hardcoded `rootfs/alpine` path
-resolves correctly (Task 6 replaces this with a registry-pulled image path).
 
 Examples:
 
 ```
-sudo ./build/container-runtime run
-sudo ./build/container-runtime run --cpu-limit 0.2 --memory-limit 50 /bin/sh
+sudo ./build/container-runtime run alpine:latest
+sudo ./build/container-runtime run --cpu-limit 0.2 --memory-limit 50 alpine:latest /bin/sh
+sudo ./build/container-runtime run python:3.11-slim python3
 ```
 
-This drops you into a shell that is isolated via four namespaces, pivoted
-into its own Alpine root filesystem, and capped by cgroup v2 CPU/memory
-limits.
+This pulls the requested image (if not already cached), mounts its layers
+via OverlayFS, and drops you into a shell (or runs the given command)
+isolated via five namespaces, pivoted into the merged image filesystem,
+capped by cgroup v2 CPU/memory limits, and networked via a veth pair to a
+NAT'd bridge with outbound internet access.
 
 ## Project layout
 
@@ -59,10 +90,11 @@ limits.
 src/main.cpp        entrypoint, CLI parsing
 src/namespaces/      namespace isolation (Phase 1)
 src/cgroups/         cgroup v2 CPU/memory limits (Phase 3)
-src/fs/              pivot_root (Phase 2) / OverlayFS (later phase)
-src/network/         veth + bridge + NAT (later phase)
-src/registry/        Docker Hub registry client (later phase)
-include/             shared headers (later phases)
+src/fs/              pivot_root (Phase 2), OverlayFS (Phase 4)
+src/network/         veth + bridge + NAT (Phase 5)
+src/registry/        Docker Hub registry client (Phase 6)
+include/             shared headers (unused so far; all headers currently
+                     live alongside their .cpp under src/)
 ```
 
 ## Phase 1: Namespaces
@@ -570,3 +602,177 @@ inet 172.20.0.1/24 scope global cr0
 $ iptables -t nat -L POSTROUTING -n | grep MASQUERADE
 MASQUERADE  all  --  172.20.0.0/24        0.0.0.0/0   (present exactly once, not duplicated)
 ```
+
+## Phase 6: Registry pull — running real Docker images end-to-end
+
+### Design
+
+`src/registry/registry.cpp`/`.hpp` implements a minimal Docker Hub
+registry v2 client using `libcurl` for HTTP and `nlohmann/json`
+(fetched automatically via CMake `FetchContent`, pinned to `v3.11.3`)
+for parsing:
+
+1. **`fetchToken(repository)`** — `GET auth.docker.io/token?service=registry.docker.io&scope=repository:<repo>:pull`.
+   Docker Hub's public registry requires a short-lived bearer token even
+   for anonymous, unauthenticated pulls of public images — this just
+   fetches one.
+2. **`fetchManifest(repository, reference, token)`** — `GET
+   registry-1.docker.io/v2/<repo>/manifests/<reference>`, with an
+   `Accept` header listing both the classic Docker v2 manifest types and
+   the OCI equivalents, plus the "manifest list" / "image index" types.
+   Official images (`alpine`, `python`, etc.) are published as a
+   **manifest list** — one manifest per CPU architecture, not a single
+   manifest — so if the response is a list, this picks the entry with
+   `architecture: amd64, os: linux` and recurses one level to fetch that
+   concrete manifest by digest.
+3. **`pull(imageRef, cacheDir)`** — parses `imageRef` (e.g.
+   `"alpine:latest"` → repository `library/alpine`, tag `latest`; the
+   `library/` prefix is Docker Hub's namespace for official images with
+   no explicit user/org), fetches the manifest, then for each entry in
+   its `layers` array downloads the blob (`GET .../blobs/<digest>`, a
+   gzipped tarball) and extracts it with `tar` into its own cache
+   subdirectory — skipping the download entirely if that directory
+   already exists and is non-empty (idempotent local caching).
+
+**Layer ordering:** a manifest lists layers base-first (index 0 = the
+image's base layer, last index = the most recently applied layer) —
+but OverlayFS's `lowerdir=` option expects the *opposite* order (leftmost
+entry = highest priority / topmost layer). `pull()` builds the list in
+manifest order, then returns it reversed, so callers can hand the result
+straight to `Overlay` as-is.
+
+**`Container`** (`src/namespaces/`) changed from taking a single
+`rootfsPath` to an `imageRef` string; `run()` now calls
+`registry::pull()` first and passes its (already correctly ordered)
+`layerDirs` straight to `fs::Overlay`, replacing the Phase 2-4
+hardcoded single-layer `rootfs/alpine` path entirely. `scripts/fetch-rootfs.sh`
+and `rootfs/alpine` (from Phase 2) are no longer used by the main flow —
+kept only as a historical artifact of how the project bootstrapped
+before a real registry client existed.
+
+**What's deliberately not implemented:** the image's `config` blob (which
+holds the image's default `CMD`/`ENTRYPOINT`/`ENV`/working directory) is
+never fetched or parsed — this runtime always requires an explicit
+command from the CLI, consistent with how it's worked since Phase 1.
+Real Docker uses the config blob to support `docker run alpine` with no
+command and get a sensible default. Also not implemented: private
+registries, authentication beyond anonymous public-image tokens, and
+content digest verification of downloaded layers (a production registry
+client would verify each blob's SHA-256 against the digest named in the
+manifest before trusting it).
+
+### Verification — two different real images, end-to-end
+
+**Alpine** (single-layer image):
+
+```
+$ time (echo 'cat /etc/os-release; echo ---; ls /; echo ---; ping -c2 8.8.8.8' \
+        | sudo ./build/container-runtime run alpine:latest /bin/sh)
+NAME="Alpine Linux"
+ID=alpine
+VERSION_ID=3.24.1
+---
+bin  dev  etc  home  lib  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var
+---
+PING 8.8.8.8 (8.8.8.8): 56 data bytes
+64 bytes from 8.8.8.8: seq=0 ttl=117 time=1.505 ms
+64 bytes from 8.8.8.8: seq=1 ttl=117 time=1.528 ms
+2 packets transmitted, 2 packets received, 0% packet loss
+
+real    0m2.194s
+```
+
+**Python 3.11-slim** (multi-layer image, different base OS entirely —
+Debian, not Alpine — proving this isn't Alpine-specific code):
+
+```
+$ time (echo 'print(1+1); import sys; print(sys.version); print(open("/etc/os-release").read())' \
+        | sudo ./build/container-runtime run python:3.11-slim python3)
+2
+3.11.15 (main, Jul  6 2026, 21:47:46) [GCC 14.2.0]
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+NAME="Debian GNU/Linux"
+...
+
+real    0m2.659s
+```
+
+A real Python interpreter, from a real pulled image, computing `1+1` and
+confirming its own OS is Debian trixie (the actual `python:3.11-slim`
+base) — not Alpine, not a locally-built rootfs.
+
+### Verification — multi-layer extraction and caching
+
+```
+$ find image-cache/library_alpine -maxdepth 2
+image-cache/library_alpine
+image-cache/library_alpine/latest
+image-cache/library_alpine/latest/55afa1ecc21d2bb5        # 1 layer
+
+$ find image-cache/library_python -maxdepth 2
+image-cache/library_python
+image-cache/library_python/3.11-slim
+image-cache/library_python/3.11-slim/298bacc1f3a58135     # 4 layers,
+image-cache/library_python/3.11-slim/3ec520ed9418633e     # extracted
+image-cache/library_python/3.11-slim/e95a6c7ea7d49b37     # and overlaid
+image-cache/library_python/3.11-slim/f66cea3b82f91b15     # correctly
+
+$ du -sh image-cache/library_alpine image-cache/library_python
+8.7M    image-cache/library_alpine
+135M    image-cache/library_python
+```
+
+(`du` printed several "Permission denied" warnings while measuring the
+Python image, e.g. on `.../root` and `.../var/cache/apt/archives/partial`
+— that's actually confirmation the extraction is *correct*: `tar`
+preserved the original restrictive permissions, like `/root` at mode
+`0700`, from the real image layers.)
+
+## Known limitations vs. real Docker
+
+Documented honestly, not glossed over:
+
+- **No image config parsing** — no default `CMD`/`ENTRYPOINT`/`ENV`;
+  every `run` requires an explicit command (Phase 6).
+- **No digest/signature verification** of pulled layers — a real registry
+  client verifies each blob's SHA-256 against its manifest-declared
+  digest before trusting it (Phase 6).
+- **No private registry or non-anonymous auth support** — only Docker
+  Hub's public, anonymous pull token flow (Phase 6).
+- **Simplified IP allocation** — container addresses are derived from the
+  container's own PID (`2 + pid % 250`), not tracked via real IPAM; fine
+  for a handful of concurrent containers in a demo, not for production
+  scale (Phase 5).
+- **RAII cleanup requires normal process exit** — if `container-runtime`
+  itself is `SIGKILL`ed (not the containerized process), no C++
+  destructor runs, and a stray cgroup or overlay directory can be left
+  behind requiring manual cleanup. Inherent to process-lifetime-scoped
+  RAII, not fixable without a separate reconciliation/GC pass (Phase 3,
+  Phase 4).
+- **No multi-container orchestration** — this runs one container per
+  invocation; there's no equivalent of `docker-compose` or a daemon
+  tracking multiple running containers across invocations.
+- **Networking uses shelled-out `ip`/`iptables`/`nsenter`**, not raw
+  rtnetlink — chosen deliberately for readability in a portfolio project;
+  documented in Phase 5.
+
+## What's proven, phase by phase
+
+1. **Namespaces** — PID 1 inside its own namespace, independent hostname,
+   verified via `$$` and `hostname` (host unaffected).
+2. **Filesystem isolation** — `pivot_root` into a real rootfs, no path
+   back to the host filesystem, verified via `/etc/os-release` and a
+   removed `/.old_root`.
+3. **Resource limits** — cgroup v2 `memory.max` triggers a real kernel
+   `mem_cgroup_out_of_memory` kill at exactly the configured limit (host
+   unaffected); `cpu.max` measured at 19.95% actual usage against a 20%
+   configured cap.
+4. **Layered storage** — two containers sharing one lower layer, writing
+   to independent upper layers with zero cross-contamination, and zero
+   disk-usage growth from the shared layer.
+5. **Networking** — outbound internet access via NAT (`ping 8.8.8.8`
+   succeeds), and two concurrently-running containers reaching each other
+   directly over the bridge (sub-millisecond latency).
+6. **Real image execution** — `alpine:latest` and `python:3.11-slim`,
+   two different base OSes, pulled live from Docker Hub and run
+   end-to-end through the full isolation/limits/network pipeline.
