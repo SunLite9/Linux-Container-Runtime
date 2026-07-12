@@ -1,12 +1,21 @@
-# Design
+# Linux Container Runtime — Engineering Design Document
 
-This document exists to preserve the reasoning behind `container-runtime`
-that doesn't survive in the code: the alternatives that were considered
-and rejected, the constraints that forced specific choices, the tradeoffs
+A Docker-like container runtime built from raw Linux kernel primitives —
+namespaces, cgroups v2, OverlayFS, and veth networking — with a real
+Docker Hub registry client on top, in C++20 with no container framework
+libraries.
+
+---
+
+## Purpose of this document
+
+This document preserves the reasoning behind `container-runtime` that
+doesn't survive in the code: the alternatives that were considered and
+rejected, the constraints that forced specific choices, the tradeoffs
 accepted deliberately rather than by accident, and what actually broke
-while building this and how that was diagnosed. The README describes
-what the system does and how to run it; this document explains why it
-looks the way it does, so that someone who has only read this file could
+while building this and how that was diagnosed. The README describes what
+the system does and how to run it; this document explains why it looks
+the way it does, so that someone who has only read this file could
 explain, defend, and probe the system as fluently as whoever built it.
 
 ## The problem, and why it's hard
@@ -468,6 +477,225 @@ mechanics, not implementing a HTTP client).
    function definition), producing `sh: bomb: not found` — a test-harness
    mistake, not a runtime bug, fixed by defining and invoking the function
    within the same `sh -c` call.
+
+## Appendix: verification evidence
+
+The README states what's been verified; this appendix has the actual
+transcripts, for anyone who wants to check the claims rather than take
+them on faith. All of it was run on a real EC2 Ubuntu host, not simulated.
+
+### Namespaces — PID and hostname isolation
+
+```
+$ echo 'echo PID inside namespace: $$; hostname' | sudo ./build/container-runtime run /bin/sh
+PID inside namespace: 1
+container
+
+$ hostname   # on the host, in a separate shell
+ip-172-31-9-167
+```
+
+`echo $$` prints `1` inside the container (its own PID namespace) and
+`hostname` differs from the host's own, which is unaffected.
+
+### Filesystem — `pivot_root` isolation
+
+```
+$ sudo ./build/container-runtime run /bin/sh
+/ $ ls /
+bin  dev  etc  home  lib  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var
+/ $ ls /.old_root
+ls: /.old_root: No such file or directory
+/ $ cat /etc/os-release
+PRETTY_NAME="Alpine Linux v3.24"
+/ $ ps aux
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    4 root      0:00 ps aux
+```
+
+```
+# on the host, in a separate shell, immediately after:
+$ ls /
+bin  boot  dev  etc  home  lib  lib64  lost+found  media  mnt  opt  proc  root  run  sbin  snap  srv  sys  tmp  usr  var
+$ cat /etc/os-release
+PRETTY_NAME="Ubuntu 26.04 LTS"
+```
+
+`/.old_root` doesn't exist (no path back to the host); `ps aux` shows only
+the container's own two processes; the host's own filesystem and process
+list are completely unaffected.
+
+### cgroups — memory limit (real OOM kill)
+
+A small memory-hog (`malloc`+`memset` in a loop, not checked into this
+repo) capped at 50 MB:
+
+```
+$ sudo ./build/container-runtime run --memory-limit 50 /usr/local/bin/memhog
+Allocated 10 MB
+Allocated 20 MB
+Allocated 30 MB
+Allocated 40 MB
+Allocated 50 MB
+```
+
+`dmesg` at the same moment:
+
+```
+memhog invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0
+...
+mem_cgroup_out_of_memory+0xc8/0xe0
+...
+oom-kill:constraint=CONSTRAINT_MEMCG,...,oom_memcg=/container-runtime/21612,task=memhog,pid=21612,uid=0
+Memory cgroup out of memory: Killed process 21612 (memhog) total-vm:62472kB, anon-rss:53480kB
+```
+
+`constraint=CONSTRAINT_MEMCG` confirms the container's own cgroup limit
+killed it, not a host-wide OOM. Host `uptime` immediately after:
+`load average: 0.03, 0.01, 0.00` — unaffected.
+
+### cgroups — CPU limit (measured, not asserted)
+
+A busy loop capped at `--cpu-limit 0.2`, sampled via the cgroup's own
+`cpu.stat` `usage_usec` counter over a 5-second window:
+
+```
+usage_usec delta: 1000143   (over 5.013890114 s wall-clock)
+1000143 µs / 1,000,000 = 1.000143 s of CPU time consumed
+1.000143 / 5.013890114 = 0.1995  →  19.95% actual CPU usage
+```
+
+19.95% against a 20% cap. The same loop uncapped pins 100% of this
+single-vCPU host.
+
+### cgroups — pids limit (real fork bomb)
+
+```
+$ echo "timeout 5 sh -c 'bomb() { bomb & bomb & }; bomb'" \
+    | sudo ./build/container-runtime run --pids-limit 20 alpine:latest /bin/sh
+sh: can't fork: Resource temporarily unavailable
+sh: can't fork: Resource temporarily unavailable
+sh: can't fork: Resource temporarily unavailable
+
+$ uptime   # immediately after
+load average: 0.00, 0.00, 0.00
+```
+
+The kernel refuses new forks (`EAGAIN`) once the 20-process cap is hit;
+the whole attempt completes in under a second with host load at `0.00`.
+
+### OverlayFS — isolation and no duplication
+
+Two containers running simultaneously, each writing a different file:
+
+```
+$ ls overlay-data/
+23631
+23638
+$ ls overlay-data/23631/merged/root/
+from_a.txt
+$ ls overlay-data/23638/merged/root/
+from_b.txt
+
+--- container B's own `ls /root`, from inside container B ---
+from_b.txt
+```
+
+Container B never sees `from_a.txt`, written concurrently by A into A's
+own upper layer. After both exit:
+
+```
+$ ls overlay-data/
+(empty)
+```
+
+Disk usage of the shared base layer, before and after both containers ran:
+
+```
+$ du -sh rootfs/alpine
+9.5M    rootfs/alpine   (unchanged both times)
+```
+
+### Networking — outbound access and container-to-container
+
+```
+$ sudo ./build/container-runtime run /bin/sh
+/ # ping -c3 8.8.8.8
+64 bytes from 8.8.8.8: seq=0 ttl=117 time=1.476 ms
+3 packets transmitted, 3 packets received, 0% packet loss
+```
+
+Two containers running concurrently, one pinging the other over the
+bridge:
+
+```
+$ ping -c3 172.20.0.3
+64 bytes from 172.20.0.3: seq=0 ttl=64 time=0.067 ms
+3 packets transmitted, 3 packets received, 0% packet loss
+```
+
+~0.06ms bridge-local latency vs. ~1.5ms to the real internet via NAT —
+consistent with direct L2 delivery. Both containers reached each other
+*and* the internet at the same time. After both exit:
+
+```
+$ ip link show type veth
+(nothing — no leftover veth interfaces)
+$ iptables -t nat -L POSTROUTING -n | grep MASQUERADE
+MASQUERADE  all  --  172.20.0.0/24        0.0.0.0/0   (present exactly once)
+```
+
+### Registry — two different real images, end-to-end
+
+```
+$ time (echo 'cat /etc/os-release; ping -c2 8.8.8.8' \
+        | sudo ./build/container-runtime run alpine:latest /bin/sh)
+PRETTY_NAME="Alpine Linux v3.24"
+2 packets transmitted, 2 packets received, 0% packet loss
+real    0m2.194s
+```
+
+```
+$ time (echo 'print(1+1); import sys; print(sys.version); print(open("/etc/os-release").read())' \
+        | sudo ./build/container-runtime run python:3.11-slim python3)
+2
+3.11.15 (main, Jul  6 2026, 21:47:46) [GCC 14.2.0]
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+real    0m2.659s
+```
+
+A real Python interpreter from a real pulled image, confirming its own
+OS is Debian trixie — not Alpine, not a locally-built rootfs. Layer
+counts differ correctly by image:
+
+```
+$ find image-cache/library_alpine -maxdepth 2   # 1 layer
+$ find image-cache/library_python -maxdepth 2   # 4 layers
+$ du -sh image-cache/library_alpine image-cache/library_python
+8.7M    image-cache/library_alpine
+135M    image-cache/library_python
+```
+
+### `scripts/test-harness.sh` — repeated-run summary
+
+```
+=== image compatibility ===
+alpine:latest: 0.79s   python:3.11-slim: 0.74s
+busybox:latest: 0.73s  debian:bookworm-slim: 0.77s
+
+=== cold vs. cached pull latency (alpine:latest) ===
+cold pull: 1.06s   cached: 0.71s
+
+=== repeated-run stats (alpine:latest, cached, x20) ===
+p50=0.736s  p95=0.920s  min=0.713s  max=0.920s
+
+=== leak check after all runs ===
+clean: no leaked mounts, cgroups, veth interfaces, or overlay dirs
+
+=== summary ===
+pass=26 fail=0 total=26  pass_rate=100.0%
+```
 
 ## Limitations, known issues, and future work
 
