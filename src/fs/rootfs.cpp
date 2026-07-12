@@ -26,9 +26,9 @@ int pivotRootSyscall(const char* newRoot, const char* putOld) {
 PivotRoot::PivotRoot(const std::string& newRoot) {
     const std::string oldRootDir = newRoot + "/.old_root";
 
-    // Phase 1: reversible setup. Nothing below has touched the process's
-    // root yet, so on failure we can cleanly unwind before rethrowing —
-    // a throwing constructor never gets its destructor called, so this
+    // Reversible setup. Nothing below has touched the process's root
+    // yet, so on failure we can cleanly unwind before rethrowing — a
+    // throwing constructor never gets its destructor called, so this
     // unwind has to happen here rather than in ~PivotRoot().
     bool bindMounted = false;
     try {
@@ -59,7 +59,7 @@ PivotRoot::PivotRoot(const std::string& newRoot) {
         throw;
     }
 
-    // Phase 2: from here on, failures are not meaningfully reversible.
+    // From here on, failures are not meaningfully reversible.
     // pivot_root() atomically swaps the process's root; there's no
     // well-defined way to "undo" a partially completed pivot, so a
     // failure past this point is fatal to the container rather than

@@ -37,8 +37,8 @@ container-runtime run <image> <command>
 ```
 
 Steps 1-2 and 5-6 happen in the parent process, before/around a `clone()`
-call; a small pipe-based readiness barrier (see Phase 5) ensures the
-child never execs the container's command until all of that is finished.
+call; a small pipe-based readiness barrier (see Networking below) ensures
+the child never execs the container's command until all of that is finished.
 
 ## Requirements
 
@@ -88,16 +88,16 @@ NAT'd bridge with outbound internet access.
 
 ```
 src/main.cpp        entrypoint, CLI parsing
-src/namespaces/      namespace isolation (Phase 1)
-src/cgroups/         cgroup v2 CPU/memory limits (Phase 3)
-src/fs/              pivot_root (Phase 2), OverlayFS (Phase 4)
-src/network/         veth + bridge + NAT (Phase 5)
-src/registry/        Docker Hub registry client (Phase 6)
+src/namespaces/      namespace isolation
+src/cgroups/         cgroup v2 CPU/memory limits
+src/fs/              pivot_root, OverlayFS
+src/network/         veth + bridge + NAT
+src/registry/        Docker Hub registry client
 include/             shared headers (unused so far; all headers currently
                      live alongside their .cpp under src/)
 ```
 
-## Phase 1: Namespaces
+## Namespaces
 
 `clone()` (from `<sched.h>`) is used instead of `fork()` + `unshare()`.
 `clone()` creates the child already inside the new namespaces in a single
@@ -153,18 +153,18 @@ ip-172-31-9-167
   `hostname` is unchanged (`ip-172-31-9-167`) — proof of `CLONE_NEWUTS`
   isolation.
 
-**Known gap in this phase:** `ps aux` run inside the container still shows
+**Known gap at this point:** `ps aux` run inside the container still shows
 the host's full process list, not just the container's own tree. This is
 expected: `ps` reads `/proc`, and the container is still using the host's
 existing `/proc` mount, which reflects the PID namespace active when it was
 originally mounted (the host's, at boot) rather than the container's new
 one. Fixing this requires mounting a fresh `procfs` *inside* the new mount
-namespace — that's what Phase 2 (`pivot_root` + mounting `/proc`) does. The
-`$$` result above is the reliable way to prove PID namespace isolation
-until then. **Update: fixed in Phase 2 below** — mounting a fresh `/proc`
-after `pivot_root` makes `ps aux` correct too.
+namespace — that's what `pivot_root` (mounting a fresh `/proc`, next
+section) does. The `$$` result above is the reliable way to prove PID
+namespace isolation until then. **Update: fixed below** — mounting a
+fresh `/proc` after `pivot_root` makes `ps aux` correct too.
 
-## Phase 2: Root filesystem via pivot_root
+## Root filesystem via pivot_root
 
 ### Getting a rootfs
 
@@ -176,8 +176,9 @@ extracts it to `rootfs/alpine`:
 ./scripts/fetch-rootfs.sh
 ```
 
-This will be replaced by our own registry puller in Task 6, which fetches
-arbitrary images (not just Alpine) from Docker Hub.
+This was later superseded by the registry client (see Registry pull
+below), which fetches arbitrary images (not just Alpine) directly from
+Docker Hub — kept here as the original bootstrap path.
 
 ### `pivot_root`, not `chroot`
 
@@ -189,9 +190,9 @@ so a process with enough privilege (or a mount namespace escape) can often
 climb back out via file descriptors opened before the `chroot`, or via
 `mount` tricks, making it a filesystem convenience rather than a real
 security boundary. `pivot_root`, combined with a private mount namespace
-(`CLONE_NEWNS` from Phase 1), actually replaces the process's root mount
-point and lets the old root be unmounted and unlinked entirely, closing
-that escape route.
+(`CLONE_NEWNS`, from the namespace setup above), actually replaces the
+process's root mount point and lets the old root be unmounted and
+unlinked entirely, closing that escape route.
 
 The steps, in `PivotRoot`'s constructor:
 
@@ -212,7 +213,7 @@ The steps, in `PivotRoot`'s constructor:
 5. **`chdir("/")`**, then **unmount and remove `/.old_root`** — severs the
    container's path back to the host filesystem entirely.
 6. **Mount a fresh `/proc`** — scoped to the new PID namespace, fixing the
-   Phase 1 `ps aux` gap noted above.
+   `ps aux` gap noted above.
 
 **RAII note:** a C++ constructor that throws never has its own destructor
 invoked — so cleanup-on-partial-failure has to happen inside the
@@ -263,12 +264,12 @@ PRETTY_NAME="Ubuntu 26.04 LTS"
   filesystem from inside the container.
 - `ps aux` now correctly shows only the container's own process tree
   (`/bin/sh` as PID 1 and `ps aux` itself) — the fresh `/proc` mount fixed
-  the Phase 1 gap.
+  the gap noted above.
 - The host's own `/`, `/etc/os-release`, and process list are completely
   unaffected — the `MS_REC | MS_PRIVATE` remount and the `pivot_root` are
   fully contained within the container's own mount and PID namespaces.
 
-## Phase 3: cgroups v2 resource limits
+## cgroups v2 resource limits
 
 ### Design
 
@@ -378,16 +379,16 @@ usage_usec delta: 1000143   (over 5.013890114 s wall-clock)
 within measurement noise. For comparison, the same loop with no cgroup at
 all pins a full core (100%) on this single-vCPU `t3.micro`.
 
-## Phase 4: OverlayFS layered filesystem
+## OverlayFS layered filesystem
 
 ### Design
 
 `cr::fs::Overlay` (`src/fs/overlay.cpp`/`.hpp`) mounts a container's root as
 an OverlayFS combining:
 
-- **`lowerdir`** — one or more read-only image layers (currently just
-  `rootfs/alpine`; Task 6's registry puller will make this a real list of
-  layers pulled from a registry).
+- **`lowerdir`** — one or more read-only image layers (populated by the
+  registry client described further below, which pulls and extracts an
+  image's real layers from Docker Hub).
 - **`upperdir`** — a fresh, container-specific writable layer.
 - **`workdir`** — OverlayFS's required scratch directory for internal
   bookkeeping (atomic rename operations, etc.) — never touched directly,
@@ -409,8 +410,8 @@ call — not a live view of the parent's future mounts. So `Container::run()`
 constructs `Overlay` (which mounts it) before calling `clone()`; the child
 then inherits the already-mounted merged directory for free, no extra
 plumbing required to get it into the container's own mount namespace. The
-existing `PivotRoot` (Phase 2) is otherwise unchanged — it just now
-receives the overlay's `mergedPath()` instead of the flat `rootfs/alpine`
+existing `PivotRoot` (described above) is otherwise unchanged — it just
+now receives the overlay's `mergedPath()` instead of a flat rootfs
 directory as its target, and mounting via `mount("overlay", merged, ...)`
 already makes `merged` a proper mount point, which is exactly what
 `pivot_root()` requires.
@@ -420,7 +421,7 @@ and removes `upper`, `work`, `merged`, and their now-empty parent directory
 — all on the *host* mount namespace/filesystem, in the parent process,
 after `waitpid()` returns in `Container::run()`. Lower layers are never
 touched by this destructor; that's what makes layer sharing free. (Hit the
-same class of bug as Phase 3's cgroup cleanup while testing this: an
+same class of bug as the cgroup cleanup above while testing this: an
 early version of `~Overlay()` removed `upper`/`work`/`merged` but forgot
 their shared parent directory, leaving an empty `overlay-data/<id>/`
 behind — fixed by explicitly removing `containerDir_` too.)
@@ -481,7 +482,7 @@ container. This is the actual mechanism (not just a claim) behind Docker's
 base image cost roughly the size of N small upper layers, not N times the
 base image size.
 
-## Phase 5: Networking — veth pairs, bridge, and NAT
+## Networking — veth pairs, bridge, and NAT
 
 ### Design
 
@@ -516,9 +517,9 @@ containers in a demo; a real implementation would track allocated
 addresses explicitly.
 
 **`CLONE_NEWNET`** was added to `Container::run()`'s `clone()` flags
-alongside the four namespaces from Phase 1.
+alongside the four namespaces described above.
 
-**The synchronization problem this phase introduced, and how it's
+**The synchronization problem networking introduced, and how it's
 solved:** `clone()` returns in the parent with the child already running
 independently — but network setup (creating the veth pair, moving it
 into the child's namespace via `/proc/<pid>/ns/net`, assigning its IP)
@@ -529,9 +530,8 @@ network exists at all. Fixed with a small pipe: `childMain()`'s very
 first action is a blocking `read()` on `readyPipe_[0]`; `run()` does all
 of its parent-side setup (bridge, veth, cgroup) and only then writes a
 byte to `readyPipe_[1]`, releasing the child. This closed the same latent
-race that existed for cgroup setup since Phase 3 (the child could
-theoretically start running before `cgroup.procs` was written) — one
-barrier now covers both.
+race that existed for cgroup setup (the child could theoretically start
+running before `cgroup.procs` was written) — one barrier now covers both.
 
 **RAII cleanup:** `~Veth()` deletes the host-side veth interface
 (`ip link del`); the kernel deletes the peer along with it, since veth
@@ -603,7 +603,7 @@ $ iptables -t nat -L POSTROUTING -n | grep MASQUERADE
 MASQUERADE  all  --  172.20.0.0/24        0.0.0.0/0   (present exactly once, not duplicated)
 ```
 
-## Phase 6: Registry pull — running real Docker images end-to-end
+## Registry pull — running real Docker images end-to-end
 
 ### Design
 
@@ -644,16 +644,16 @@ straight to `Overlay` as-is.
 **`Container`** (`src/namespaces/`) changed from taking a single
 `rootfsPath` to an `imageRef` string; `run()` now calls
 `registry::pull()` first and passes its (already correctly ordered)
-`layerDirs` straight to `fs::Overlay`, replacing the Phase 2-4
-hardcoded single-layer `rootfs/alpine` path entirely. `scripts/fetch-rootfs.sh`
-and `rootfs/alpine` (from Phase 2) are no longer used by the main flow —
-kept only as a historical artifact of how the project bootstrapped
-before a real registry client existed.
+`layerDirs` straight to `fs::Overlay`, replacing the earlier hardcoded
+single-layer `rootfs/alpine` path entirely. `scripts/fetch-rootfs.sh` and
+`rootfs/alpine` are no longer used by the main flow — kept only as a
+historical artifact of how the project bootstrapped before a real
+registry client existed.
 
 **What's deliberately not implemented:** the image's `config` blob (which
 holds the image's default `CMD`/`ENTRYPOINT`/`ENV`/working directory) is
 never fetched or parsed — this runtime always requires an explicit
-command from the CLI, consistent with how it's worked since Phase 1.
+command from the CLI, consistent with how it has always worked.
 Real Docker uses the config blob to support `docker run alpine` with no
 command and get a sensible default. Also not implemented: private
 registries, authentication beyond anonymous public-image tokens, and
@@ -733,30 +733,28 @@ preserved the original restrictive permissions, like `/root` at mode
 Documented honestly, not glossed over:
 
 - **No image config parsing** — no default `CMD`/`ENTRYPOINT`/`ENV`;
-  every `run` requires an explicit command (Phase 6).
+  every `run` requires an explicit command.
 - **No digest/signature verification** of pulled layers — a real registry
   client verifies each blob's SHA-256 against its manifest-declared
-  digest before trusting it (Phase 6).
+  digest before trusting it.
 - **No private registry or non-anonymous auth support** — only Docker
-  Hub's public, anonymous pull token flow (Phase 6).
+  Hub's public, anonymous pull token flow.
 - **Simplified IP allocation** — container addresses are derived from the
   container's own PID (`2 + pid % 250`), not tracked via real IPAM; fine
   for a handful of concurrent containers in a demo, not for production
-  scale (Phase 5).
+  scale.
 - **RAII cleanup requires normal process exit** — if `container-runtime`
   itself is `SIGKILL`ed (not the containerized process), no C++
   destructor runs, and a stray cgroup or overlay directory can be left
   behind requiring manual cleanup. Inherent to process-lifetime-scoped
-  RAII, not fixable without a separate reconciliation/GC pass (Phase 3,
-  Phase 4).
+  RAII, not fixable without a separate reconciliation/GC pass.
 - **No multi-container orchestration** — this runs one container per
   invocation; there's no equivalent of `docker-compose` or a daemon
   tracking multiple running containers across invocations.
 - **Networking uses shelled-out `ip`/`iptables`/`nsenter`**, not raw
-  rtnetlink — chosen deliberately for readability in a portfolio project;
-  documented in Phase 5.
+  rtnetlink — chosen deliberately for readability in a portfolio project.
 
-## What's proven, phase by phase
+## What's proven
 
 1. **Namespaces** — PID 1 inside its own namespace, independent hostname,
    verified via `$$` and `hostname` (host unaffected).
