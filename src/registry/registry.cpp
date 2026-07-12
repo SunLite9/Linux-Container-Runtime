@@ -18,11 +18,6 @@ using json = nlohmann::json;
 constexpr const char* kAuthUrl = "https://auth.docker.io/token";
 constexpr const char* kRegistryUrl = "https://registry-1.docker.io";
 
-// Accept both the classic Docker v2 manifest types and the newer OCI
-// equivalents, plus the "manifest list" / "image index" types used for
-// multi-architecture images (e.g. official "alpine" and "python" images
-// are published as a list of per-architecture manifests, not a single
-// manifest).
 constexpr const char* kManifestAcceptHeader =
     "Accept: application/vnd.docker.distribution.manifest.v2+json,"
     "application/vnd.docker.distribution.manifest.list.v2+json,"
@@ -38,10 +33,6 @@ size_t writeToFile(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return fwrite(ptr, size, nmemb, static_cast<FILE*>(userdata));
 }
 
-// Shared setup for both string- and file-destined GETs: URL, headers,
-// redirect-following (the registry issues redirects to a CDN for blob
-// downloads), and a descriptive error on any curl-level failure or
-// non-2xx HTTP status.
 CURLcode performGet(CURL* curl, const std::string& url, const std::vector<std::string>& headers,
                      struct curl_slist** headerListOut, long* httpCodeOut) {
     struct curl_slist* headerList = nullptr;
@@ -115,8 +106,8 @@ void httpDownloadToFile(const std::string& url, const std::vector<std::string>& 
 }
 
 struct ImageRef {
-    std::string repository; // e.g. "library/alpine"
-    std::string tag;         // e.g. "latest"
+    std::string repository;
+    std::string tag;
 };
 
 ImageRef parseImageRef(const std::string& imageRef) {
@@ -128,8 +119,6 @@ ImageRef parseImageRef(const std::string& imageRef) {
         tag = name.substr(colon + 1);
         name = name.substr(0, colon);
     }
-    // Docker Hub's "official images" (no user/org prefix) live under the
-    // "library/" namespace, e.g. "alpine" -> "library/alpine".
     if (name.find('/') == std::string::npos) {
         name = "library/" + name;
     }
@@ -143,10 +132,6 @@ std::string fetchToken(const std::string& repository) {
     return body.at("token").get<std::string>();
 }
 
-// Fetches a manifest, following one level of indirection through a
-// multi-architecture "manifest list" / "image index" if the registry
-// returns one instead of a concrete manifest — official images are
-// published this way so the same tag works on amd64, arm64, etc.
 json fetchManifest(const std::string& repository, const std::string& reference, const std::string& token) {
     const std::string url = std::string(kRegistryUrl) + "/v2/" + repository + "/manifests/" + reference;
     const json manifest = json::parse(
@@ -168,8 +153,6 @@ json fetchManifest(const std::string& repository, const std::string& reference, 
     throw std::runtime_error("no linux/amd64 manifest found for " + repository + ":" + reference);
 }
 
-// Filesystem-safe cache subdirectory name for a repository, e.g.
-// "library/alpine" -> "library_alpine".
 std::string sanitize(const std::string& repository) {
     std::string s = repository;
     for (char& c : s) {
@@ -192,7 +175,7 @@ PulledImage pull(const std::string& imageRef, const std::string& cacheDir) {
 
     std::vector<std::string> layerDirsBaseToTop;
     for (const auto& layer : manifest.at("layers")) {
-        const std::string digest = layer.at("digest").get<std::string>(); // "sha256:<hex>"
+        const std::string digest = layer.at("digest").get<std::string>();
         const std::string shortId = digest.substr(digest.find(':') + 1, 16);
         const std::string layerDir = imageCacheDir + "/" + shortId;
 
@@ -212,8 +195,6 @@ PulledImage pull(const std::string& imageRef, const std::string& cacheDir) {
         layerDirsBaseToTop.push_back(layerDir);
     }
 
-    // OverlayFS's lowerdir convention lists the topmost layer first;
-    // manifests list layers base-first, so reverse before returning.
     PulledImage result;
     result.layerDirs.assign(layerDirsBaseToTop.rbegin(), layerDirsBaseToTop.rend());
     return result;

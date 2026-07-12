@@ -20,9 +20,6 @@ std::string joinLowerDirs(const std::vector<std::string>& lowerDirs) {
         if (i != 0) {
             joined += ':';
         }
-        // overlayfs resolves lowerdir/upperdir/workdir relative to the
-        // mounting process's cwd if given as relative paths, but absolute
-        // paths avoid any ambiguity.
         joined += stdfs::absolute(lowerDirs[i]).string();
     }
     return joined;
@@ -53,13 +50,11 @@ Overlay::~Overlay() {
     if (mounted_) {
         umount2(merged_.c_str(), MNT_DETACH);
     }
-    // Only upper/work/merged are container-specific; lowerDirs (the
-    // shared image layers) are never touched here.
     std::error_code ec;
     stdfs::remove_all(upper_, ec);
     stdfs::remove_all(work_, ec);
     stdfs::remove_all(merged_, ec);
-    stdfs::remove(containerDir_, ec); // the now-empty overlay-data/<id>/ itself
+    stdfs::remove(containerDir_, ec);
 }
 
 } // namespace cr::fs

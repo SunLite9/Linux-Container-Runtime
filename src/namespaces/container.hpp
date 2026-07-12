@@ -8,15 +8,6 @@
 
 namespace cr {
 
-// Runs a command inside new PID, UTS, IPC, mount, and network namespaces.
-//
-// RAII note: the clone()'d child is synchronously waited on inside run(),
-// so there is no long-lived kernel resource for the destructor to release
-// yet. The destructor still reaps the child if run() was never called to
-// completion (e.g. an exception unwinds through here), which is the pattern
-// later phases (cgroups, overlay mounts, network namespaces) build on: each
-// resource-owning class cleans itself up on destruction, not via manual
-// cleanup calls scattered through main().
 class Container {
 public:
     Container(std::string imageRef, std::string command, std::vector<std::string> args,
@@ -26,10 +17,6 @@ public:
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
 
-    // Pulls imageRef (from the registry cache, or Docker Hub if not
-    // cached), mounts an overlay over its layers, clones the isolated
-    // child, pivots it into the merged overlay directory, execs the
-    // command inside it, and blocks until it exits.
     void run();
 
 private:
@@ -41,13 +28,7 @@ private:
     std::vector<std::string> args_;
     cgroups::Limits limits_;
     pid_t childPid_ = -1;
-    // Set by run() before clone(), to the overlay's merged directory;
-    // childMain() pivot_roots into this rather than rootfsPath_ directly.
     std::string pivotTarget_;
-    // Readiness barrier: childMain() blocks reading readyPipe_[0] before
-    // doing anything else, so nothing in the container execs until run()
-    // has finished setting up its network and cgroup from the parent
-    // side (both need the child's PID, which only exists after clone()).
     int readyPipe_[2] = {-1, -1};
 };
 

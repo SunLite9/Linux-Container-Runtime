@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Downloads the official Alpine minirootfs tarball and extracts it to
-# ./rootfs/alpine, for use as a container root filesystem.
-# Superseded by the registry client (src/registry/), which pulls
-# arbitrary images from Docker Hub instead of just Alpine; kept here as
-# the original bootstrap path.
+# Downloads the official Alpine minirootfs tarball to ./rootfs/alpine.
 set -euo pipefail
 
 ARCH="x86_64"

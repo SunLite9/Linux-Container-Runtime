@@ -9,13 +9,9 @@ namespace cr::network {
 
 namespace {
 
-// Shells out to `ip`/`iptables`/`nsenter` rather than talking to
-// rtnetlink directly: this is a portfolio project, and these are the
-// exact commands a human operator would run by hand to debug the same
-// setup, which keeps the code close to self-documenting. The tradeoff is
-// fragility to exit-code/quoting edge cases that raw netlink wouldn't
-// have — real production runtimes (runc, etc.) use netlink for exactly
-// that reason.
+// Shells out to ip/iptables/nsenter rather than talking to rtnetlink
+// directly; simpler for a portfolio project, at the cost of exit-code
+// fragility that raw netlink wouldn't have.
 void runCmd(const std::string& cmd) {
     const int rc = std::system(cmd.c_str());
     if (rc != 0) {
@@ -23,8 +19,6 @@ void runCmd(const std::string& cmd) {
     }
 }
 
-// For idempotent/best-effort steps where failure (e.g. "already exists",
-// "already deleted") is expected and harmless.
 void runCmdIgnore(const std::string& cmd) {
     (void)!std::system(cmd.c_str());
 }
@@ -41,13 +35,8 @@ void ensureBridge() {
         runCmd(std::string("ip addr add ") + kBridgeIp + "/24 dev " + kBridgeName);
     }
     runCmd(std::string("ip link set ") + kBridgeName + " up");
-
-    // Idempotent: writing "1" when it's already "1" is a harmless no-op.
     runCmd("sysctl -q -w net.ipv4.ip_forward=1");
 
-    // `iptables -C` checks whether a rule already exists; only `-A`ppend
-    // it if not, so re-running this before every container doesn't pile
-    // up duplicate NAT/FORWARD rules.
     const std::string masqueradeRule =
         "POSTROUTING -s " + std::string(kSubnetCidr) + " ! -o " + kBridgeName + " -j MASQUERADE";
     if (!commandSucceeds("iptables -t nat -C " + masqueradeRule)) {
@@ -63,8 +52,7 @@ void ensureBridge() {
 }
 
 Veth::Veth(pid_t containerPid, int ipHostOctet) {
-    // Interface names are capped at 15 characters (IFNAMSIZ); truncating
-    // the PID keeps "veth<suffix>h"/"veth<suffix>c" safely under that.
+    // IFNAMSIZ caps interface names at 15 chars.
     const std::string suffix = std::to_string(containerPid % 100000);
     hostIfName_ = "veth" + suffix + "h";
     const std::string peerName = "veth" + suffix + "c";
@@ -74,14 +62,8 @@ Veth::Veth(pid_t containerPid, int ipHostOctet) {
     runCmd("ip link add " + hostIfName_ + " type veth peer name " + peerName);
     runCmd("ip link set " + hostIfName_ + " master " + kBridgeName);
     runCmd("ip link set " + hostIfName_ + " up");
-    // Moves the peer out of this (host) namespace and into the
-    // container's, addressed by containerPid as seen from here.
     runCmd("ip link set " + peerName + " netns " + pidStr);
 
-    // From here on, configure the interface *inside* the container's
-    // network namespace by joining it with nsenter rather than moving
-    // more state around — containerPid must still be alive (blocked on
-    // the readiness pipe) for /proc/<pid>/ns/net to be valid.
     const std::string ns = "nsenter -t " + pidStr + " -n --";
     runCmd(ns + " ip link set " + peerName + " name eth0");
     runCmd(ns + " ip addr add " + containerIp + "/24 dev eth0");
@@ -91,9 +73,6 @@ Veth::Veth(pid_t containerPid, int ipHostOctet) {
 }
 
 Veth::~Veth() {
-    // Deleting either end of a veth pair deletes both; the container-side
-    // peer's netns is also being torn down around the same time as the
-    // container's last process exits.
     runCmdIgnore("ip link del " + hostIfName_ + " > /dev/null 2>&1");
 }
 
