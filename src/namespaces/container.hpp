@@ -8,7 +8,7 @@
 
 namespace cr {
 
-// Runs a command inside new PID, UTS, IPC, and mount namespaces.
+// Runs a command inside new PID, UTS, IPC, mount, and network namespaces.
 //
 // RAII note: the clone()'d child is synchronously waited on inside run(),
 // so there is no long-lived kernel resource for the destructor to release
@@ -43,6 +43,11 @@ private:
     // Set by run() before clone(), to the overlay's merged directory;
     // childMain() pivot_roots into this rather than rootfsPath_ directly.
     std::string pivotTarget_;
+    // Readiness barrier: childMain() blocks reading readyPipe_[0] before
+    // doing anything else, so nothing in the container execs until run()
+    // has finished setting up its network and cgroup from the parent
+    // side (both need the child's PID, which only exists after clone()).
+    int readyPipe_[2] = {-1, -1};
 };
 
 } // namespace cr

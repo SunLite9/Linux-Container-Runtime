@@ -10,6 +10,7 @@ add_executable(container-runtime
     src/fs/rootfs.cpp
     src/fs/overlay.cpp
     src/cgroups/cgroups.cpp
+    src/network/network.cpp
 )
 
 target_include_directories(container-runtime PRIVATE include src)

@@ -448,3 +448,125 @@ container. This is the actual mechanism (not just a claim) behind Docker's
 "shared base layers" storage efficiency: N containers built on the same
 base image cost roughly the size of N small upper layers, not N times the
 base image size.
+
+## Phase 5: Networking — veth pairs, bridge, and NAT
+
+### Design
+
+`src/network/network.cpp`/`.hpp` adds two pieces:
+
+- **`ensureBridge()`** — idempotent, host-level setup: creates a Linux
+  bridge `cr0` with `172.20.0.1/24` (if missing), brings it up, enables
+  `net.ipv4.ip_forward`, and adds `iptables` NAT (`MASQUERADE`) and
+  `FORWARD` rules for the `172.20.0.0/24` subnet. Called before every
+  container run; `iptables -C` is used to check whether a rule already
+  exists before `-A`ppending it, so repeated calls don't pile up
+  duplicates.
+- **`cr::network::Veth`** — one veth pair per container: host end
+  attached to `cr0`, peer end moved into the container's network
+  namespace (`ip link set <peer> netns <pid>`), then configured *inside*
+  that namespace via `nsenter -t <pid> -n -- ...` (renamed `eth0`, given
+  an IP, brought up, default route added via the bridge).
+
+**Why shell out to `ip`/`iptables`/`nsenter` instead of raw rtnetlink:**
+this is a portfolio project, and these are the exact commands a human
+operator would run by hand to debug the same setup — the code reads
+close to a transcript of what it's doing. The tradeoff is fragility to
+exit-code/quoting edge cases that talking to rtnetlink directly wouldn't
+have; real production runtimes (`runc`, etc.) use netlink for exactly
+that reason. Documented here as a deliberate, known simplification, not
+an oversight.
+
+**IP allocation:** each container's address is derived from its own PID
+(`2 + pid % 250`) — there's no real IPAM (no persistent lease tracking,
+no collision detection). Good enough for a handful of concurrently-running
+containers in a demo; a real implementation would track allocated
+addresses explicitly.
+
+**`CLONE_NEWNET`** was added to `Container::run()`'s `clone()` flags
+alongside the four namespaces from Phase 1.
+
+**The synchronization problem this phase introduced, and how it's
+solved:** `clone()` returns in the parent with the child already running
+independently — but network setup (creating the veth pair, moving it
+into the child's namespace via `/proc/<pid>/ns/net`, assigning its IP)
+can only happen *after* `clone()` returns, since it needs the child's
+PID. Without something to stop it, the child could `execvp()` the
+container's actual command (e.g. immediately try to `ping`) before its
+network exists at all. Fixed with a small pipe: `childMain()`'s very
+first action is a blocking `read()` on `readyPipe_[0]`; `run()` does all
+of its parent-side setup (bridge, veth, cgroup) and only then writes a
+byte to `readyPipe_[1]`, releasing the child. This closed the same latent
+race that existed for cgroup setup since Phase 3 (the child could
+theoretically start running before `cgroup.procs` was written) — one
+barrier now covers both.
+
+**RAII cleanup:** `~Veth()` deletes the host-side veth interface
+(`ip link del`); the kernel deletes the peer along with it, since veth
+interfaces are always destroyed in pairs, and the container's network
+namespace itself is torn down once its last process exits. The shared
+`cr0` bridge is deliberately *not* torn down per-container — it's host
+infrastructure meant to persist across container runs, closer to how
+Docker's `docker0` bridge behaves.
+
+### Verification — outbound internet access
+
+```
+$ sudo ./build/container-runtime run /bin/sh
+# inside the container:
+/ # ip addr show eth0
+inet 172.20.0.53/24 scope global eth0
+/ # ip route
+default via 172.20.0.1 dev eth0
+172.20.0.0/24 dev eth0 scope link src 172.20.0.53
+/ # ping -c3 8.8.8.8
+PING 8.8.8.8 (8.8.8.8): 56 data bytes
+64 bytes from 8.8.8.8: seq=0 ttl=117 time=1.476 ms
+64 bytes from 8.8.8.8: seq=1 ttl=117 time=1.421 ms
+64 bytes from 8.8.8.8: seq=2 ttl=117 time=1.474 ms
+
+--- 8.8.8.8 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss
+```
+
+### Verification — two containers reaching each other
+
+Ran container A (gets `172.20.0.3`, sleeps), then container B (gets
+`172.20.0.62`) 2 seconds later, concurrently:
+
+```
+--- container A ---
+inet 172.20.0.3/24 scope global eth0
+
+--- container B ---
+inet 172.20.0.62/24 scope global eth0
+---
+$ ping -c3 172.20.0.3          # B pinging A, over the cr0 bridge
+PING 172.20.0.3 (172.20.0.3): 56 data bytes
+64 bytes from 172.20.0.3: seq=0 ttl=64 time=0.067 ms
+64 bytes from 172.20.0.3: seq=1 ttl=64 time=0.060 ms
+64 bytes from 172.20.0.3: seq=2 ttl=64 time=0.062 ms
+3 packets transmitted, 3 packets received, 0% packet loss
+---
+$ ping -c2 8.8.8.8              # B still reaching the internet too
+64 bytes from 8.8.8.8: seq=0 ttl=117 time=1.452 ms
+64 bytes from 8.8.8.8: seq=1 ttl=117 time=1.468 ms
+2 packets transmitted, 2 packets received, 0% packet loss
+```
+
+Sub-millisecond (~0.06ms) round-trip between the two containers confirms
+direct bridge-local delivery (versus ~1.5ms to the real internet via
+NAT). Both containers reached each other *and* the internet simultaneously.
+
+### Verification — cleanup
+
+```
+$ ip link show type veth        # after both containers exited
+(nothing — no leftover veth interfaces)
+
+$ ip addr show cr0               # bridge persists (shared infra, by design)
+inet 172.20.0.1/24 scope global cr0
+
+$ iptables -t nat -L POSTROUTING -n | grep MASQUERADE
+MASQUERADE  all  --  172.20.0.0/24        0.0.0.0/0   (present exactly once, not duplicated)
+```
