@@ -1,5 +1,9 @@
 #include "network.hpp"
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -27,9 +31,34 @@ bool commandSucceeds(const std::string& cmd) {
     return std::system((cmd + " > /dev/null 2>&1").c_str()) == 0;
 }
 
+// Serializes ensureBridge() across concurrently-starting containers.
+// Without this, two invocations can both see the bridge missing and
+// both run `ip link add`, so the loser fails with "File exists".
+class FileLock {
+public:
+    explicit FileLock(const std::string& path) {
+        fd_ = open(path.c_str(), O_CREAT | O_RDWR, 0644);
+        if (fd_ < 0) {
+            throw std::runtime_error("open lock file failed: " + path);
+        }
+        flock(fd_, LOCK_EX);
+    }
+    ~FileLock() {
+        flock(fd_, LOCK_UN);
+        close(fd_);
+    }
+    FileLock(const FileLock&) = delete;
+    FileLock& operator=(const FileLock&) = delete;
+
+private:
+    int fd_ = -1;
+};
+
 } // namespace
 
 void ensureBridge() {
+    FileLock lock("/run/container-runtime-bridge.lock");
+
     if (!commandSucceeds(std::string("ip link show ") + kBridgeName)) {
         runCmd(std::string("ip link add ") + kBridgeName + " type bridge");
         runCmd(std::string("ip addr add ") + kBridgeIp + "/24 dev " + kBridgeName);

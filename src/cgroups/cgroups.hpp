@@ -8,10 +8,11 @@ namespace cr::cgroups {
 struct Limits {
     double cpuCores = 0.5; // fraction of one core
     long memoryMb = 100;
+    long pidsMax = 128;
 };
 
 // Owns one cgroup v2 group at /sys/fs/cgroup/container-runtime/<containerId>
-// enforcing cpu.max / memory.max for a container's process tree.
+// enforcing cpu.max / memory.max / pids.max for a container's process tree.
 class CGroup {
 public:
     CGroup(std::string containerId, const Limits& limits);

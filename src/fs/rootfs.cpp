@@ -55,6 +55,15 @@ PivotRoot::PivotRoot(const std::string& newRoot) {
     if (chdir("/") != 0) {
         throwErrno("chdir(/)");
     }
+
+    // Image layers ship without device nodes; bind-mount the host's /dev
+    // (still reachable at /.old_root/dev) so /dev/null etc. exist. Must
+    // happen before the old root is unmounted below.
+    mkdir("/dev", 0755);
+    if (mount("/.old_root/dev", "/dev", nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+        throwErrno("mount(bind /dev)");
+    }
+
     if (umount2("/.old_root", MNT_DETACH) != 0) {
         throwErrno("umount2(.old_root)");
     }

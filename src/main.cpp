@@ -10,9 +10,10 @@
 namespace {
 void printUsage(const char* prog) {
     std::cerr << "Usage: " << prog
-              << " run [--cpu-limit N] [--memory-limit MB] <image> [command] [args...]\n";
+              << " run [--cpu-limit N] [--memory-limit MB] [--pids-limit N] <image> [command] [args...]\n";
     std::cerr << "  --cpu-limit N       fraction of one CPU core (default 0.5)\n";
     std::cerr << "  --memory-limit MB   memory cap in megabytes (default 100)\n";
+    std::cerr << "  --pids-limit N      max processes/threads in the container (default 128)\n";
     std::cerr << "  <image>             e.g. alpine:latest, python:3.11-slim\n";
     std::cerr << "  (default command is /bin/sh; must be run with sudo)\n";
 }
@@ -38,6 +39,8 @@ int main(int argc, char** argv) {
             limits.cpuCores = std::stod(argv[++i]);
         } else if (arg == "--memory-limit" && i + 1 < argc) {
             limits.memoryMb = std::stol(argv[++i]);
+        } else if (arg == "--pids-limit" && i + 1 < argc) {
+            limits.pidsMax = std::stol(argv[++i]);
         } else {
             break;
         }
